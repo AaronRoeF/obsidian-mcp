@@ -1,5 +1,5 @@
 {
-  "name": "obsidian-mcp",
+  "name": "@roebot0/obsidian-mcp",
   "version": "1.0.0",
   "description": "MCP server for Obsidian vault operations via the Obsidian CLI — search, read, create, graph navigation, daily notes, templates, and more.",
   "main": "dist/index.js",

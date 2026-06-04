@@ -1,0 +1,6 @@
+# Build artifacts — generated from src/ via tsc
+dist/
+
+# npm
+node_modules/
+*.log
