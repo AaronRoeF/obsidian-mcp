@@ -1,6 +1,81 @@
 import { obsidianExec, obsidianExecJSON, ok, err } from './cli.js';
+import { execSync } from 'child_process';
+import { readFileSync, realpathSync } from 'fs';
+import { join } from 'path';
 
 const log = (...args: unknown[]) => console.error('[obsidian-search]', ...args);
+
+// ---------------------------------------------------------------------------
+// Filesystem fallback. The Obsidian CLI's search commands silently return
+// nothing on out-of-date installers (the app hot-updates its asar; the CLI in
+// the installer binary does not). An empty CLI result is therefore
+// indistinguishable from "no matches" — so any empty result falls through to
+// a grep over the vault, which honors .obsidian/app.json userIgnoreFilters.
+// The response carries source: 'filesystem-fallback' so a consumer can tell.
+// ---------------------------------------------------------------------------
+
+let cachedVaultPath: string | null = null;
+
+function vaultPath(): string {
+  if (cachedVaultPath) return cachedVaultPath;
+  if (process.env.OBSIDIAN_VAULT_PATH) {          // config-provided: no CLI dependency
+    cachedVaultPath = process.env.OBSIDIAN_VAULT_PATH;
+    return cachedVaultPath;
+  }
+  // vault:info works even when search is broken, but rapid sequential CLI calls
+  // against the app socket can flake to empty — try twice before giving up.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const info = obsidianExec('vault:info', {});
+    const m = info.match(/^path\t(.+)$/m);
+    if (m) { cachedVaultPath = m[1].trim(); return cachedVaultPath; }
+  }
+  throw new Error('vault:info returned no path — set OBSIDIAN_VAULT_PATH to enable the filesystem fallback');
+}
+
+function ignorePrefixes(root: string): string[] {
+  try {
+    const app = JSON.parse(readFileSync(join(root, '.obsidian', 'app.json'), 'utf-8'));
+    return Array.isArray(app.userIgnoreFilters) ? app.userIgnoreFilters : [];
+  } catch {
+    return [];
+  }
+}
+
+function fsFallbackSearch(query: string, opts: { path?: string; limit: number; caseSensitive: boolean }): SearchResult[] {
+  // The vault path is often a symlink (~/Exo -> iCloud); grep won't descend
+  // through a symlink given as the start path, so resolve it first.
+  const root = realpathSync(vaultPath());
+  const searchRoot = opts.path ? join(root, opts.path) : root;
+  const flag = opts.caseSensitive ? '' : '-i';
+  let raw = '';
+  try {
+    raw = execSync(
+      `grep -rn ${flag} -F --include='*.md' ` +
+      `--exclude-dir='.git' --exclude-dir='.git.nosync' --exclude-dir='.obsidian' ` +
+      `--exclude-dir='.trash' --exclude-dir='node_modules' ` +
+      `-e ${JSON.stringify(query)} ${JSON.stringify(searchRoot)}`,
+      { encoding: 'utf-8', timeout: 30000, maxBuffer: 32 * 1024 * 1024 },
+    );
+  } catch (e: unknown) {
+    const g = e as { status?: number; stdout?: string };
+    if (g.status === 1) raw = g.stdout ?? '';   // grep exit 1 = no matches
+    else throw e;
+  }
+  const ignored = ignorePrefixes(root);
+  const fileMap = new Map<string, SearchMatch[]>();
+  for (const line of raw.split('\n')) {
+    const m = line.match(/^(.+?\.md):(\d+):(.*)$/);
+    if (!m) continue;
+    const rel = m[1].startsWith(root + '/') ? m[1].slice(root.length + 1) : m[1];
+    if (ignored.some(p => rel.startsWith(p))) continue;   // Obsidian Excluded Files
+    if (!fileMap.has(rel)) {
+      if (fileMap.size >= opts.limit) continue;
+      fileMap.set(rel, []);
+    }
+    fileMap.get(rel)!.push({ line: parseInt(m[2]), text: m[3].trim() });
+  }
+  return [...fileMap.entries()].map(([file, matches]) => ({ file, matches }));
+}
 
 interface SearchMatch {
   line: number;
@@ -97,26 +172,32 @@ function handleSearch(args: Record<string, unknown>) {
 
   // Fallback: parse text format (file:line: text)
   const textRaw = obsidianExec('search:context', { ...cliArgs, format: 'text' });
-  if (!textRaw) return ok({ results: [], total: 0 });
 
   const results: SearchResult[] = [];
-  const fileMap = new Map<string, SearchMatch[]>();
-
-  for (const line of textRaw.split('\n')) {
-    // Format: "path/file.md:42: matching text here"
-    const match = line.match(/^(.+?\.md):(\d+):\s*(.+)$/);
-    if (match) {
-      const [, file, lineNum, text] = match;
-      if (!fileMap.has(file)) fileMap.set(file, []);
-      fileMap.get(file)!.push({ line: parseInt(lineNum), text: text.trim() });
+  if (textRaw) {
+    const fileMap = new Map<string, SearchMatch[]>();
+    for (const line of textRaw.split('\n')) {
+      // Format: "path/file.md:42: matching text here"
+      const match = line.match(/^(.+?\.md):(\d+):\s*(.+)$/);
+      if (match) {
+        const [, file, lineNum, text] = match;
+        if (!fileMap.has(file)) fileMap.set(file, []);
+        fileMap.get(file)!.push({ line: parseInt(lineNum), text: text.trim() });
+      }
+    }
+    for (const [file, matches] of fileMap) {
+      results.push({ file, matches });
     }
   }
+  if (results.length > 0) return ok({ results, total: results.length });
 
-  for (const [file, matches] of fileMap) {
-    results.push({ file, matches });
-  }
-
-  return ok({ results, total: results.length });
+  // Both CLI attempts empty — on a stale installer that means nothing. Grep is truth.
+  const fbResults = fsFallbackSearch(query, {
+    path: args.path as string | undefined,
+    limit: (args.limit as number) || 20,
+    caseSensitive: !!args.case_sensitive,
+  });
+  return ok({ results: fbResults, total: fbResults.length, source: 'filesystem-fallback' });
 }
 
 function handleTags(args: Record<string, unknown>) {
